@@ -20,6 +20,9 @@
   #up { grid-column: 2; grid-row: 1; } #left { grid-column: 1; grid-row: 2; }
   #restart { grid-column: 2; grid-row: 2; font-size: 22px !important; }
   #right { grid-column: 3; grid-row: 2; } #down { grid-column: 2; grid-row: 3; }
+  #tilt { margin-top: 12px; padding: 10px 18px; font-size: 16px; border: none; border-radius: 10px;
+          background: #333; color: #eee; -webkit-tap-highlight-color: transparent; }
+  #tilt.on { background: #2a6; }
 </style>
 </head>
 <body>
@@ -32,7 +35,8 @@
   <button id="right" data-dir="right" aria-label="Right">▶</button>
   <button id="down" data-dir="down" aria-label="Down">▼</button>
 </div>
-<p>Arrow keys / WASD / swipe / buttons to move · Space or tap to restart</p>
+<button id="tilt">Tilt control: Off</button>
+<p>Arrow keys / WASD / swipe / buttons / tilt to move · Space or tap to restart</p>
 <script>
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
@@ -137,6 +141,43 @@ canvas.addEventListener('touchend', e => {
                                     : (dy > 0 ? DIRS.down : DIRS.up));
 }, {passive: false});
 canvas.addEventListener('click', () => { if (over) reset(); });
+
+// Tilt control (device orientation). Enabling it calibrates to the current hold angle.
+const tiltBtn = document.getElementById('tilt');
+const TILT_THRESHOLD = 12; // degrees away from the calibrated position before turning
+let tiltOn = false, base = null;
+
+function onOrient(e) {
+  if (e.beta == null || e.gamma == null) return;
+  if (!base) { base = {beta: e.beta, gamma: e.gamma}; return; }
+  let x = e.gamma - base.gamma, y = e.beta - base.beta; // portrait: right = +x, top tipped away = -y
+  const angle = (screen.orientation && screen.orientation.angle) ?? window.orientation ?? 0;
+  if (angle === 90 || angle === -270) [x, y] = [y, -x];
+  else if (angle === 270 || angle === -90) [x, y] = [-y, x];
+  else if (angle === 180) [x, y] = [-x, -y];
+  if (Math.max(Math.abs(x), Math.abs(y)) < TILT_THRESHOLD) return;
+  turn(Math.abs(x) > Math.abs(y) ? (x > 0 ? DIRS.right : DIRS.left)
+                                 : (y > 0 ? DIRS.down : DIRS.up));
+}
+
+async function setTilt(on) {
+  if (on) {
+    if (typeof DeviceOrientationEvent === 'undefined') { alert('Tilt not supported on this device.'); return; }
+    if (typeof DeviceOrientationEvent.requestPermission === 'function') { // iOS
+      try {
+        if (await DeviceOrientationEvent.requestPermission() !== 'granted') { alert('Motion access denied.'); return; }
+      } catch (err) { alert('Motion access failed: ' + err.message); return; }
+    }
+    base = null;
+    window.addEventListener('deviceorientation', onOrient);
+  } else {
+    window.removeEventListener('deviceorientation', onOrient);
+  }
+  tiltOn = on;
+  tiltBtn.textContent = 'Tilt control: ' + (on ? 'On' : 'Off');
+  tiltBtn.classList.toggle('on', on);
+}
+tiltBtn.addEventListener('click', () => setTilt(!tiltOn));
 
 reset();
 setInterval(() => { step(); draw(); }, 120);
