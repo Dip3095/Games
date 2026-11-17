@@ -32,8 +32,8 @@
 </header>
 <div class="row">
   <select id="mode" aria-label="Mode">
-    <option value="balance">Balance</option>
-    <option value="free">Free swing</option>
+    <option value="balance">Start upright</option>
+    <option value="swing">Start hanging</option>
   </select>
   <select id="segments" aria-label="Segments">
     <option value="1">1 segment</option>
@@ -55,14 +55,14 @@
   </select>
   <button id="start">Start</button>
 </div>
-<div id="hud"><span>Time: <b id="time">0.0s</b></span><span>Best: <b id="best">0.0s</b></span></div>
+<div id="hud"><span>Upright: <b id="time">0.0s</b></span><span>Best: <b id="best">0.0s</b></span></div>
 <canvas id="c"></canvas>
-<p id="info">Drag the base left/right (and up/down) to keep the pendulum upright.</p>
+<p id="info"></p>
 <script>
 // ---------- Physics: n-link pendulum of point masses on a moving pivot ----------
 // Angles are measured from straight down (upright = PI). y axis points down.
 // Pivot acceleration (ax, ay) acts as a change in effective gravity: g_eff = (-ax, G - ay).
-const G = 9.81, L = 0.3, MASS = 1, Y_TRAVEL = 0.12;
+const G = 9.81, L = 0.3, MASS = 1;
 const DIFF = {
   easy:   {timeScale: 0.35, damping: 0.02},
   normal: {timeScale: 0.6,  damping: 0.008},
@@ -145,21 +145,24 @@ function pivotAccel() {
     ax = gain * phoneAcc.x - 6 * pivot.x - 5 * pivot.vx;
     ay = gain * phoneAcc.y - 6 * pivot.y - 5 * pivot.vy;
   } else {
-    // Base chases the finger (critically damped spring)
-    ax = 150 * (target.x - pivot.x) - 24 * pivot.vx;
-    ay = 150 * (target.y - pivot.y) - 24 * pivot.vy;
+    // Base chases the finger (critically damped spring), tuned so it keeps up with the
+    // finger in real time even when the simulation runs in slow motion.
+    const k = 150 / (timeScale * timeScale), c = 24 / timeScale;
+    ax = k * (target.x - pivot.x) - c * pivot.vx;
+    ay = k * (target.y - pivot.y) - c * pivot.vy;
   }
   // Soft walls at the ends of the track
   const wall = (p, v, lim) => Math.abs(p) > lim ? -400 * (p - Math.sign(p) * lim) - 30 * v : 0;
   ax += wall(pivot.x, pivot.vx, xMax);
-  ay += wall(pivot.y, pivot.vy, Y_TRAVEL);
-  const cap = 80;
+  ay += wall(pivot.y, pivot.vy, layout.yMax);
+  const cap = 80 / (control === 'touch' ? timeScale * timeScale : 1);
   return {ax: Math.max(-cap, Math.min(cap, ax)), ay: Math.max(-cap, Math.min(cap, ay))};
 }
 
 function onMotion(e) {
   const a = e.acceleration;
   if (!a || a.x == null || a.y == null) { info('No motion data from this device. Use Touch control.'); return; }
+  // Only the screen-plane axes (x, y) are used; z (towards/away from you) is ignored.
   // Device axes: x right, y up. Map to screen x right / y down for the current rotation.
   let x = a.x, yUp = a.y;
   const ang = (screen.orientation && screen.orientation.angle) ?? window.orientation ?? 0;
@@ -201,12 +204,11 @@ async function setControl(c) {
 const canvas = document.getElementById('c'), ctx = canvas.getContext('2d');
 const $ = id => document.getElementById(id);
 const ctrlBtn = $('control'), startBtn = $('start');
-let state = 'ready', mode = 'balance', elapsed = 0, trail = [];
+let state = 'ready', mode = 'balance', streak = 0, best = 0, trail = [];
 let layout = {};
 
 function hint() {
-  return mode === 'free' ? 'Free swing: watch the chaos, drag the base to stir it up.'
-                         : 'Drag the base left/right (and up/down) to keep the pendulum upright.';
+  return 'Drag the base anywhere (X and Y). Swing the pendulum up and hold it upright.';
 }
 function info(t) { $('info').textContent = t; }
 function bestKey() { return `tpb-best-${n}-${$('difficulty').value}`; }
@@ -217,17 +219,15 @@ function resetPendulum() {
   n = +$('segments').value;
   mode = $('mode').value;
   ({damping, timeScale} = DIFF[$('difficulty').value]);
-  if (mode === 'balance') {
-    th = Array.from({length: n}, () => Math.PI + (Math.random() - 0.5) * 0.03);
-  } else {
-    th = Array.from({length: n}, (_, i) => Math.PI / 2 + (Math.random() - 0.5) * 0.2 + i * 0.3);
-  }
+  th = mode === 'balance'
+    ? Array.from({length: n}, () => Math.PI + (Math.random() - 0.5) * 0.03) // upright, tiny wobble
+    : Array.from({length: n}, () => (Math.random() - 0.5) * 0.1);           // hanging down
   om = new Array(n).fill(0);
   pivot.x = pivot.y = pivot.vx = pivot.vy = 0;
   target.x = target.y = 0;
-  elapsed = 0; trail = [];
+  streak = 0; trail = []; best = loadBest();
   $('time').textContent = '0.0s';
-  $('best').textContent = mode === 'balance' ? loadBest().toFixed(1) + 's' : '–';
+  $('best').textContent = best.toFixed(1) + 's';
   if (control === 'touch') info(hint());
   resize();
 }
@@ -241,16 +241,10 @@ function resize() {
   canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
   canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  const reach = n * L;
-  let s, cy;
-  if (mode === 'balance') {
-    s = Math.min((H - 40) / (reach + 2 * Y_TRAVEL), (W / 2 - 20) / reach);
-    cy = H - 20 - Y_TRAVEL * s;
-  } else {
-    s = Math.min((H / 2 - 20) / (reach + Y_TRAVEL), (W / 2 - 20) / reach);
-    cy = H / 2;
-  }
-  layout = {W, H, s, cx: W / 2, cy, xMax: Math.max(0.2, (W / 2 - 30) / s)};
+  // Base rests at the centre; the pendulum fits above or below it. The base can travel over
+  // the whole board in X and Y.
+  const s = 0.85 * Math.min(W / 2, H / 2) / (n * L);
+  layout = {W, H, s, cx: W / 2, cy: H / 2, xMax: (W / 2 - 26) / s, yMax: (H / 2 - 12) / s};
 }
 
 function toScreen(x, y) { return [layout.cx + x * layout.s, layout.cy + y * layout.s]; }
@@ -269,7 +263,7 @@ function frame(now) {
       if (keys.ArrowLeft) target.x -= v; if (keys.ArrowRight) target.x += v;
       if (keys.ArrowUp) target.y -= v;   if (keys.ArrowDown) target.y += v;
       target.x = Math.max(-layout.xMax, Math.min(layout.xMax, target.x));
-      target.y = Math.max(-Y_TRAVEL, Math.min(Y_TRAVEL, target.y));
+      target.y = Math.max(-layout.yMax, Math.min(layout.yMax, target.y));
     }
     const simDt = dtReal * timeScale, steps = Math.ceil(simDt / 0.002), h = simDt / steps;
     for (let k = 0; k < steps; k++) {
@@ -278,38 +272,34 @@ function frame(now) {
       pivot.vx += ax * h; pivot.vy += ay * h;
       pivot.x += pivot.vx * h; pivot.y += pivot.vy * h;
     }
-    elapsed += simDt;
-    $('time').textContent = elapsed.toFixed(1) + 's';
-    if (mode === 'free') {
-      let x = pivot.x, y = pivot.y;
-      th.forEach(t => { x += L * Math.sin(t); y += L * Math.cos(t); });
-      trail.push([x, y]); if (trail.length > 400) trail.shift();
-    } else {
-      if (tipHeight() < 0.5 * n * L) {
-        state = 'over';
-        if (elapsed > loadBest()) { saveBest(elapsed); $('best').textContent = elapsed.toFixed(1) + 's'; }
-      }
+    // No game over: count how long the pendulum is held upright; a fall just resets the streak.
+    if (tipHeight() >= 0.9 * n * L) {
+      streak += simDt;
+      if (streak > best) { best = streak; $('best').textContent = best.toFixed(1) + 's'; }
+    } else if (streak > 0) {
+      if (streak >= best) saveBest(best);
+      streak = 0;
     }
+    $('time').textContent = streak.toFixed(1) + 's';
+    let x = pivot.x, y = pivot.y;
+    th.forEach(t => { x += L * Math.sin(t); y += L * Math.cos(t); });
+    trail.push([x, y]); if (trail.length > 300) trail.shift();
   }
   draw();
   requestAnimationFrame(frame);
 }
 
 function draw() {
-  const {W, H, s, xMax} = layout;
+  const {W, H, s} = layout;
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
-  // Track and vertical travel zone
-  const [lx, ty] = toScreen(-xMax, -Y_TRAVEL), [rx, by] = toScreen(xMax, Y_TRAVEL);
-  ctx.fillStyle = '#151515'; ctx.fillRect(lx, ty, rx - lx, by - ty);
-  const [, cyy] = toScreen(0, 0);
-  ctx.strokeStyle = '#444'; ctx.lineWidth = 2;
-  ctx.beginPath(); ctx.moveTo(lx, cyy); ctx.lineTo(rx, cyy); ctx.stroke();
-  // Upright guide
-  if (mode === 'balance') {
-    const [gx, gy] = toScreen(pivot.x, pivot.y);
-    ctx.setLineDash([4, 6]); ctx.strokeStyle = '#2a3a2a';
-    ctx.beginPath(); ctx.moveTo(gx, gy); ctx.lineTo(gx, gy - n * L * s); ctx.stroke(); ctx.setLineDash([]);
-  }
+  // Centre cross-hair (base home position)
+  const [cx0, cy0] = toScreen(0, 0);
+  ctx.strokeStyle = '#222'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, cy0); ctx.lineTo(W, cy0); ctx.moveTo(cx0, 0); ctx.lineTo(cx0, H); ctx.stroke();
+  // Upright guide (green when held upright)
+  const [gx, gy] = toScreen(pivot.x, pivot.y);
+  ctx.setLineDash([4, 6]); ctx.strokeStyle = streak > 0 ? '#2a6' : '#2a3a2a'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(gx, gy); ctx.lineTo(gx, gy - n * L * s); ctx.stroke(); ctx.setLineDash([]);
   // Trail
   if (trail.length > 1) {
     ctx.strokeStyle = 'rgba(120,170,255,0.35)'; ctx.lineWidth = 1.5; ctx.beginPath();
@@ -339,7 +329,7 @@ function draw() {
     ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(0, 0, W, H);
     ctx.fillStyle = '#fff'; ctx.textAlign = 'center';
     ctx.font = '26px system-ui';
-    ctx.fillText(state === 'over' ? `Fell after ${elapsed.toFixed(1)}s` : 'Triple Pendulum Balance', W / 2, H / 2 - 10);
+    ctx.fillText('Triple Pendulum Balance', W / 2, H / 2 - 10);
     ctx.font = '15px system-ui';
     ctx.fillText('Tap here or press Start', W / 2, H / 2 + 20);
   }
@@ -364,7 +354,7 @@ canvas.addEventListener('pointermove', e => {
   if (!dragging) return;
   const p = pointerToMetres(e);
   target.x = Math.max(-layout.xMax, Math.min(layout.xMax, p.x + canvas._grab.dx));
-  target.y = Math.max(-Y_TRAVEL, Math.min(Y_TRAVEL, p.y + canvas._grab.dy));
+  target.y = Math.max(-layout.yMax, Math.min(layout.yMax, p.y + canvas._grab.dy));
 });
 const endDrag = () => { dragging = false; };
 canvas.addEventListener('pointerup', endDrag);
