@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Triple Pendulum Balance</title>
+<style>
+  body { margin: 0; min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+         background: #111; color: #eee; font-family: system-ui, sans-serif;
+         touch-action: manipulation; -webkit-user-select: none; user-select: none; }
+  header { width: min(94vw, 560px); display: flex; align-items: center; justify-content: space-between;
+           margin: 8px 0 4px; }
+  header a { color: #8bd; text-decoration: none; font-size: 15px; }
+  h1 { font-size: 18px; margin: 0; }
+  .row { width: min(94vw, 560px); display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; margin: 4px 0; }
+  select, button { font-size: 15px; padding: 7px 10px; border: none; border-radius: 9px;
+                   background: #333; color: #eee; -webkit-tap-highlight-color: transparent; }
+  button.on { background: #2a6; }
+  #start { background: #2a6; font-weight: 600; }
+  #hud { width: min(94vw, 560px); display: flex; justify-content: space-between; font-size: 15px;
+         margin: 4px 0; font-variant-numeric: tabular-nums; }
+  canvas { display: block; background: #000; border: 2px solid #444; border-radius: 6px; touch-action: none; }
+  #info { font-size: 13px; color: #9a9; min-height: 1.2em; margin: 6px 8px; text-align: center;
+          font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<header>
+  <a href="index.html">← Games</a>
+  <h1>Triple Pendulum Balance</h1>
+  <span style="width:56px"></span>
+</header>
+<div class="row">
+  <select id="mode" aria-label="Mode">
+    <option value="balance">Balance</option>
+    <option value="free">Free swing</option>
+  </select>
+  <select id="segments" aria-label="Segments">
+    <option value="1">1 segment</option>
+    <option value="2">2 segments</option>
+    <option value="3" selected>3 segments</option>
+  </select>
+  <select id="difficulty" aria-label="Difficulty">
+    <option value="easy" selected>Easy</option>
+    <option value="normal">Normal</option>
+    <option value="hard">Hard (real time)</option>
+  </select>
+</div>
+<div class="row">
+  <button id="control">Control: Touch</button>
+  <select id="gain" aria-label="Motion sensitivity">
+    <option value="1">Sensitivity 1×</option>
+    <option value="2" selected>Sensitivity 2×</option>
+    <option value="4">Sensitivity 4×</option>
+  </select>
+  <button id="start">Start</button>
+</div>
+<div id="hud"><span>Time: <b id="time">0.0s</b></span><span>Best: <b id="best">0.0s</b></span></div>
+<canvas id="c"></canvas>
+<p id="info">Drag the base left/right (and up/down) to keep the pendulum upright.</p>
+<script>
+// ---------- Physics: n-link pendulum of point masses on a moving pivot ----------
+// Angles are measured from straight down (upright = PI). y axis points down.
+// Pivot acceleration (ax, ay) acts as a change in effective gravity: g_eff = (-ax, G - ay).
+const G = 9.81, L = 0.3, MASS = 1, Y_TRAVEL = 0.12;
+const DIFF = {
+  easy:   {timeScale: 0.35, damping: 0.02},
+  normal: {timeScale: 0.6,  damping: 0.008},
+  hard:   {timeScale: 1.0,  damping: 0.002},
+};
+
+let n = 3, th = [], om = [], damping = DIFF.easy.damping, timeScale = DIFF.easy.timeScale;
+const pivot = {x: 0, y: 0, vx: 0, vy: 0};
+
+function solve(A, b) { // Gaussian elimination with partial pivoting
+  const m = b.length;
+  for (let k = 0; k < m; k++) {
+    let p = k;
+    for (let i = k + 1; i < m; i++) if (Math.abs(A[i][k]) > Math.abs(A[p][k])) p = i;
+    [A[k], A[p]] = [A[p], A[k]]; [b[k], b[p]] = [b[p], b[k]];
+    for (let i = k + 1; i < m; i++) {
+      const f = A[i][k] / A[k][k];
+      for (let j = k; j < m; j++) A[i][j] -= f * A[k][j];
+      b[i] -= f * b[k];
+    }
+  }
+  const x = new Array(m);
+  for (let i = m - 1; i >= 0; i--) {
+    let s = b[i];
+    for (let j = i + 1; j < m; j++) s -= A[i][j] * x[j];
+    x[i] = s / A[i][i];
+  }
+  return x;
+}
+
+function angularAccel(th, om, gx, gy) {
+  const A = [], b = [];
+  for (let i = 0; i < n; i++) {
+    A.push([]);
+    const mui = (n - i) * MASS; // total mass at or beyond link i
+    let bi = mui * L * (gx * Math.cos(th[i]) - gy * Math.sin(th[i]));
+    for (let j = 0; j < n; j++) {
+      const muij = (n - Math.max(i, j)) * MASS;
+      A[i].push(muij * L * L * Math.cos(th[i] - th[j]));
+      bi -= muij * L * L * Math.sin(th[i] - th[j]) * om[j] * om[j];
+    }
+    // Joint friction: each joint resists relative rotation of the two parts it connects
+    bi -= damping * (om[i] - (i ? om[i - 1] : 0));
+    if (i < n - 1) bi += damping * (om[i + 1] - om[i]);
+    b.push(bi);
+  }
+  return solve(A, b);
+}
+
+function rk4(dt, gx, gy) {
+  const add = (a, b, h) => a.map((v, i) => v + b[i] * h);
+  const k1t = om,                 k1o = angularAccel(th, om, gx, gy);
+  const t2 = add(th, k1t, dt / 2), o2 = add(om, k1o, dt / 2);
+  const k2t = o2,                 k2o = angularAccel(t2, o2, gx, gy);
+  const t3 = add(th, k2t, dt / 2), o3 = add(om, k2o, dt / 2);
+  const k3t = o3,                 k3o = angularAccel(t3, o3, gx, gy);
+  const t4 = add(th, k3t, dt),     o4 = add(om, k3o, dt);
+  const k4t = o4,                 k4o = angularAccel(t4, o4, gx, gy);
+  th = th.map((v, i) => v + dt / 6 * (k1t[i] + 2 * k2t[i] + 2 * k3t[i] + k4t[i]));
+  om = om.map((v, i) => v + dt / 6 * (k1o[i] + 2 * k2o[i] + 2 * k3o[i] + k4o[i]));
+}
+
+function tipHeight() { // height of the last mass above the pivot, metres
+  return -th.reduce((s, t) => s + L * Math.cos(t), 0);
+}
+
+// ---------- Controls ----------
+let control = 'touch', gain = 2;
+const target = {x: 0, y: 0};
+let dragging = false;
+const phoneAcc = {x: 0, y: 0}; // filtered, screen coords, x right / y down, m/s²
+let lastMotionTime = 0;
+const keys = {};
+
+function pivotAccel() {
+  let ax, ay;
+  const xMax = layout.xMax;
+  if (control === 'motion') {
+    // The phone is the base: its acceleration drives the base, a weak spring re-centres it.
+    ax = gain * phoneAcc.x - 6 * pivot.x - 5 * pivot.vx;
+    ay = gain * phoneAcc.y - 6 * pivot.y - 5 * pivot.vy;
+  } else {
+    // Base chases the finger (critically damped spring)
+    ax = 150 * (target.x - pivot.x) - 24 * pivot.vx;
+    ay = 150 * (target.y - pivot.y) - 24 * pivot.vy;
+  }
+  // Soft walls at the ends of the track
+  const wall = (p, v, lim) => Math.abs(p) > lim ? -400 * (p - Math.sign(p) * lim) - 30 * v : 0;
+  ax += wall(pivot.x, pivot.vx, xMax);
+  ay += wall(pivot.y, pivot.vy, Y_TRAVEL);
+  const cap = 80;
+  return {ax: Math.max(-cap, Math.min(cap, ax)), ay: Math.max(-cap, Math.min(cap, ay))};
+}
+
+function onMotion(e) {
+  const a = e.acceleration;
+  if (!a || a.x == null || a.y == null) { info('No motion data from this device. Use Touch control.'); return; }
+  // Device axes: x right, y up. Map to screen x right / y down for the current rotation.
+  let x = a.x, yUp = a.y;
+  const ang = (screen.orientation && screen.orientation.angle) ?? window.orientation ?? 0;
+  if (ang === 90 || ang === -270) [x, yUp] = [-a.y, a.x];
+  else if (ang === 270 || ang === -90) [x, yUp] = [a.y, -a.x];
+  else if (ang === 180) [x, yUp] = [-a.x, -a.y];
+  const dz = v => Math.abs(v) < 0.15 ? 0 : v; // ignore sensor noise
+  phoneAcc.x += 0.5 * (dz(x) - phoneAcc.x);
+  phoneAcc.y += 0.5 * (dz(-yUp) - phoneAcc.y);
+  lastMotionTime = performance.now();
+}
+
+async function setControl(c) {
+  if (c === 'motion') {
+    if (typeof DeviceMotionEvent === 'undefined') { info('Motion sensors not supported here.'); return; }
+    if (typeof DeviceMotionEvent.requestPermission === 'function') { // iOS
+      try {
+        if (await DeviceMotionEvent.requestPermission() !== 'granted') {
+          info('Motion access denied. iPhone: Settings > Safari > Advanced > Website Data, delete github.io, reload.');
+          return;
+        }
+      } catch (err) { info('Motion access failed: ' + err.message); return; }
+    }
+    window.addEventListener('devicemotion', onMotion);
+    lastMotionTime = 0;
+    info('Waiting for motion data…');
+  } else {
+    window.removeEventListener('devicemotion', onMotion);
+    phoneAcc.x = phoneAcc.y = 0;
+    target.x = pivot.x; target.y = pivot.y;
+    info(hint());
+  }
+  control = c;
+  ctrlBtn.textContent = 'Control: ' + (c === 'motion' ? 'Phone motion' : 'Touch');
+  ctrlBtn.classList.toggle('on', c === 'motion');
+}
+
+// ---------- Game state ----------
+const canvas = document.getElementById('c'), ctx = canvas.getContext('2d');
+const $ = id => document.getElementById(id);
+const ctrlBtn = $('control'), startBtn = $('start');
+let state = 'ready', mode = 'balance', elapsed = 0, trail = [];
+let layout = {};
+
+function hint() {
+  return mode === 'free' ? 'Free swing: watch the chaos, drag the base to stir it up.'
+                         : 'Drag the base left/right (and up/down) to keep the pendulum upright.';
+}
+function info(t) { $('info').textContent = t; }
+function bestKey() { return `tpb-best-${n}-${$('difficulty').value}`; }
+function loadBest() { try { return +localStorage.getItem(bestKey()) || 0; } catch { return 0; } }
+function saveBest(v) { try { localStorage.setItem(bestKey(), v); } catch {} }
+
+function resetPendulum() {
+  n = +$('segments').value;
+  mode = $('mode').value;
+  ({damping, timeScale} = DIFF[$('difficulty').value]);
+  if (mode === 'balance') {
+    th = Array.from({length: n}, () => Math.PI + (Math.random() - 0.5) * 0.03);
+  } else {
+    th = Array.from({length: n}, (_, i) => Math.PI / 2 + (Math.random() - 0.5) * 0.2 + i * 0.3);
+  }
+  om = new Array(n).fill(0);
+  pivot.x = pivot.y = pivot.vx = pivot.vy = 0;
+  target.x = target.y = 0;
+  elapsed = 0; trail = [];
+  $('time').textContent = '0.0s';
+  $('best').textContent = mode === 'balance' ? loadBest().toFixed(1) + 's' : '–';
+  if (control === 'touch') info(hint());
+  resize();
+}
+
+function start() { resetPendulum(); state = 'playing'; startBtn.textContent = 'Restart'; }
+
+function resize() {
+  const W = Math.min(window.innerWidth * 0.94, 560);
+  const H = Math.max(260, Math.min(W * 1.2, window.innerHeight - 250));
+  const dpr = window.devicePixelRatio || 1;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const reach = n * L;
+  let s, cy;
+  if (mode === 'balance') {
+    s = Math.min((H - 40) / (reach + 2 * Y_TRAVEL), (W / 2 - 20) / reach);
+    cy = H - 20 - Y_TRAVEL * s;
+  } else {
+    s = Math.min((H / 2 - 20) / (reach + Y_TRAVEL), (W / 2 - 20) / reach);
+    cy = H / 2;
+  }
+  layout = {W, H, s, cx: W / 2, cy, xMax: Math.max(0.2, (W / 2 - 30) / s)};
+}
+
+function toScreen(x, y) { return [layout.cx + x * layout.s, layout.cy + y * layout.s]; }
+
+// ---------- Main loop ----------
+let last = performance.now();
+function frame(now) {
+  const dtReal = Math.min(0.05, (now - last) / 1000); last = now;
+  if (control === 'motion' && lastMotionTime && now - lastMotionTime < 500) {
+    info(`Phone accel  x ${phoneAcc.x.toFixed(1)}  y ${phoneAcc.y.toFixed(1)} m/s²  — move the phone, not tilt`);
+  }
+  if (state === 'playing') {
+    // Keyboard nudges the drag target on desktop
+    if (control === 'touch') {
+      const v = 1.2 * dtReal;
+      if (keys.ArrowLeft) target.x -= v; if (keys.ArrowRight) target.x += v;
+      if (keys.ArrowUp) target.y -= v;   if (keys.ArrowDown) target.y += v;
+      target.x = Math.max(-layout.xMax, Math.min(layout.xMax, target.x));
+      target.y = Math.max(-Y_TRAVEL, Math.min(Y_TRAVEL, target.y));
+    }
+    const simDt = dtReal * timeScale, steps = Math.ceil(simDt / 0.002), h = simDt / steps;
+    for (let k = 0; k < steps; k++) {
+      const {ax, ay} = pivotAccel();
+      rk4(h, -ax, G - ay);
+      pivot.vx += ax * h; pivot.vy += ay * h;
+      pivot.x += pivot.vx * h; pivot.y += pivot.vy * h;
+    }
+    elapsed += simDt;
+    $('time').textContent = elapsed.toFixed(1) + 's';
+    if (mode === 'free') {
+      let x = pivot.x, y = pivot.y;
+      th.forEach(t => { x += L * Math.sin(t); y += L * Math.cos(t); });
+      trail.push([x, y]); if (trail.length > 400) trail.shift();
+    } else {
+      if (tipHeight() < 0.5 * n * L) {
+        state = 'over';
+        if (elapsed > loadBest()) { saveBest(elapsed); $('best').textContent = elapsed.toFixed(1) + 's'; }
+      }
+    }
+  }
+  draw();
+  requestAnimationFrame(frame);
+}
+
+function draw() {
+  const {W, H, s, xMax} = layout;
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  // Track and vertical travel zone
+  const [lx, ty] = toScreen(-xMax, -Y_TRAVEL), [rx, by] = toScreen(xMax, Y_TRAVEL);
+  ctx.fillStyle = '#151515'; ctx.fillRect(lx, ty, rx - lx, by - ty);
+  const [, cyy] = toScreen(0, 0);
+  ctx.strokeStyle = '#444'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(lx, cyy); ctx.lineTo(rx, cyy); ctx.stroke();
+  // Upright guide
+  if (mode === 'balance') {
+    const [gx, gy] = toScreen(pivot.x, pivot.y);
+    ctx.setLineDash([4, 6]); ctx.strokeStyle = '#2a3a2a';
+    ctx.beginPath(); ctx.moveTo(gx, gy); ctx.lineTo(gx, gy - n * L * s); ctx.stroke(); ctx.setLineDash([]);
+  }
+  // Trail
+  if (trail.length > 1) {
+    ctx.strokeStyle = 'rgba(120,170,255,0.35)'; ctx.lineWidth = 1.5; ctx.beginPath();
+    trail.forEach(([x, y], i) => { const [a, b] = toScreen(x, y); i ? ctx.lineTo(a, b) : ctx.moveTo(a, b); });
+    ctx.stroke();
+  }
+  // Links
+  const colors = ['#e94', '#4ce', '#c6f'];
+  let x = pivot.x, y = pivot.y;
+  const pts = [toScreen(x, y)];
+  th.forEach(t => { x += L * Math.sin(t); y += L * Math.cos(t); pts.push(toScreen(x, y)); });
+  ctx.lineCap = 'round';
+  for (let i = 0; i < n; i++) {
+    ctx.strokeStyle = colors[i]; ctx.lineWidth = 6;
+    ctx.beginPath(); ctx.moveTo(...pts[i]); ctx.lineTo(...pts[i + 1]); ctx.stroke();
+  }
+  for (let i = 1; i <= n; i++) {
+    ctx.fillStyle = '#eee'; ctx.beginPath(); ctx.arc(...pts[i], 7, 0, 2 * Math.PI); ctx.fill();
+  }
+  // Base (cart)
+  const [bx, byy] = pts[0];
+  ctx.fillStyle = dragging ? '#7f7' : '#3c3';
+  ctx.fillRect(bx - 22, byy - 8, 44, 16);
+  ctx.fillStyle = '#111'; ctx.beginPath(); ctx.arc(bx, byy, 4, 0, 2 * Math.PI); ctx.fill();
+  // Overlays
+  if (state !== 'playing') {
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#fff'; ctx.textAlign = 'center';
+    ctx.font = '26px system-ui';
+    ctx.fillText(state === 'over' ? `Fell after ${elapsed.toFixed(1)}s` : 'Triple Pendulum Balance', W / 2, H / 2 - 10);
+    ctx.font = '15px system-ui';
+    ctx.fillText('Tap here or press Start', W / 2, H / 2 + 20);
+  }
+}
+
+// ---------- Input wiring ----------
+function pointerToMetres(e) {
+  const r = canvas.getBoundingClientRect();
+  return {x: (e.clientX - r.left - layout.cx) / layout.s, y: (e.clientY - r.top - layout.cy) / layout.s};
+}
+canvas.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  if (state !== 'playing') { start(); return; }
+  if (control !== 'touch') return;
+  dragging = true; canvas.setPointerCapture(e.pointerId);
+  const p = pointerToMetres(e);
+  // Grab relative to the current base position so the base doesn't jump to the finger
+  target.x = pivot.x; target.y = pivot.y;
+  canvas._grab = {dx: pivot.x - p.x, dy: pivot.y - p.y};
+});
+canvas.addEventListener('pointermove', e => {
+  if (!dragging) return;
+  const p = pointerToMetres(e);
+  target.x = Math.max(-layout.xMax, Math.min(layout.xMax, p.x + canvas._grab.dx));
+  target.y = Math.max(-Y_TRAVEL, Math.min(Y_TRAVEL, p.y + canvas._grab.dy));
+});
+const endDrag = () => { dragging = false; };
+canvas.addEventListener('pointerup', endDrag);
+canvas.addEventListener('pointercancel', endDrag);
+
+document.addEventListener('keydown', e => {
+  if (e.key.startsWith('Arrow')) { keys[e.key] = true; e.preventDefault(); }
+  if (e.key === ' ') { start(); e.preventDefault(); }
+});
+document.addEventListener('keyup', e => { keys[e.key] = false; });
+
+ctrlBtn.addEventListener('click', () => setControl(control === 'touch' ? 'motion' : 'touch'));
+$('gain').addEventListener('change', e => { gain = +e.target.value; });
+startBtn.addEventListener('click', start);
+['mode', 'segments', 'difficulty'].forEach(id => $(id).addEventListener('change', () => {
+  state = 'ready'; startBtn.textContent = 'Start'; resetPendulum();
+}));
+window.addEventListener('resize', resize);
+
+resetPendulum();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
